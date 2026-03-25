@@ -2,6 +2,8 @@ import requests
 import time
 import os
 import math
+import xml.etree.ElementTree as ET
+import re as _re
 from datetime import datetime, timezone, timedelta
 
 
@@ -55,6 +57,318 @@ SINARMAS_CALENDAR = {
         29:"L",30:"L",31:"O"},
 }
 
+
+# ── 📈 US 10Y TREASURY YIELD ──────────────────────────
+TRUMP_ZONE_LOW  = 4.30
+TRUMP_ZONE_HIGH = 4.50
+
+def fetch_us10y_yield():
+    """Fetch US 10Y Treasury Yield dari FRED API"""
+    try:
+        url = (
+            f"https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id=DGS10"
+            f"&api_key={FRED_KEY}"
+            f"&sort_order=desc"
+            f"&limit=5"
+            f"&file_type=json"
+        )
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        obs = data.get("observations", [])
+        # Ambil data terbaru yang valid (bukan ".")
+        for o in obs:
+            if o["value"] != ".":
+                return {
+                    "yield": float(o["value"]),
+                    "date":  o["date"],
+                }
+        return None
+    except Exception as e:
+        print(f"[FRED ERROR] {e}")
+        return None
+
+def analyze_yield(y):
+    """Analisa yield dan dampak ke gold"""
+    if y is None: return None
+    val = y["yield"]
+
+    if val > TRUMP_ZONE_HIGH:
+        return {
+            "val":    val,
+            "zone":   "ABOVE",
+            "emoji":  "🔴",
+            "label":  f"DI ATAS ZONA ({val:.2f}%)",
+            "impact": "📉 BEARISH Gold",
+            "desc":   "Yield tinggi = USD kuat = Gold tertekan",
+            "trump":  "⚠️ Belum ada Trump good news",
+            "gold":   "Fokus SELL di resistance",
+            "prob":   "Yield turun: 100% (histori) kalau masuk zona",
+        }
+    elif TRUMP_ZONE_LOW <= val <= TRUMP_ZONE_HIGH:
+        return {
+            "val":    val,
+            "zone":   "DANGER",
+            "emoji":  "⚡",
+            "label":  f"TRUMP DANGER ZONE ({val:.2f}%)",
+            "impact": "📈 Potensi BULLISH Gold!",
+            "desc":   "Historis Trump buat good news = yield turun = Gold naik",
+            "trump":  "✅ Kemungkinan Trump good news segera! (81% historis)",
+            "gold":   "⚠️ Waspada reversal BUY! Siapkan setup BUY di support",
+            "prob":   "81% yield TURUN dalam 5 hari berikutnya!",
+        }
+    else:
+        return {
+            "val":    val,
+            "zone":   "BELOW",
+            "emoji":  "🟢",
+            "label":  f"DI BAWAH ZONA ({val:.2f}%)",
+            "impact": "📈 BULLISH Gold",
+            "desc":   "Yield rendah = USD lemah = Gold didukung naik",
+            "trump":  "✅ Zone aman, Trump tidak perlu intervensi",
+            "gold":   "✅ Fokus BUY di support kuat",
+            "prob":   "Market relatif tenang dari faktor yield",
+        }
+
+def send_yield_alert(analysis, is_new=False):
+    """Kirim alert yield ke Telegram"""
+    if not analysis: return
+    moon   = get_moon_phase()
+    impact = get_moon_impact(moon["phase_en"])
+    prefix = "🚨 *YIELD ALERT BARU!*" if is_new else "📊 *US 10Y YIELD UPDATE*"
+    send_telegram(
+        f"{prefix}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"{analysis['emoji']} *{analysis['label']}*\n"
+        f"📅 Data: {analysis.get('date','')}\n\n"
+        f"💥 *Dampak Gold:*\n"
+        f"{analysis['impact']}\n"
+        f"📝 {analysis['desc']}\n\n"
+        f"🇺🇸 *Trump Factor:*\n"
+        f"{analysis['trump']}\n\n"
+        f"📊 *Probabilitas:*\n"
+        f"{analysis['prob']}\n\n"
+        f"💡 *Strategi Gold:*\n"
+        f"{analysis['gold']}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🌙 {moon['phase']} | {impact['bias']}\n"
+        f"🕐 {now_wita().strftime('%H:%M')} WITA\n"
+        f"📡 Sumber: FRED (Federal Reserve)"
+    )
+
+
+# ── 📰 NEWS & ECONOMIC CALENDAR ──────────────────────
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Jadwal news high impact (jam WIB, update manual tiap bulan)
+ECONOMIC_EVENTS = {
+    # Format: "MM-DD": [{"time":"HH:MM","impact":"HIGH/MED","name":"...","desc":"..."}]
+    # Bot akan fetch otomatis dari RSS untuk breaking news
+}
+
+def fetch_gold_news():
+    """Fetch berita gold terbaru dari RSS feeds"""
+    feeds = [
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=GC=F&region=US&lang=en-US",
+        "https://www.investing.com/rss/news_285.rss",
+    ]
+    articles = []
+    for url in feeds:
+        try:
+            r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            root = ET.fromstring(r.content)
+            for item in root.findall(".//item")[:3]:
+                title = item.findtext("title", "")
+                desc  = item.findtext("description", "")
+                pub   = item.findtext("pubDate", "")
+                # Bersihkan HTML tags
+                desc = _re.sub('<[^<]+?>', '', desc)[:200]
+                if title:
+                    articles.append({
+                        "title": title.strip(),
+                        "desc":  desc.strip(),
+                        "pub":   pub.strip()
+                    })
+            if articles: break
+        except Exception as e:
+            print(f"[RSS] {e}")
+            continue
+    return articles[:5]
+
+def analyze_news_with_ai(articles, price):
+    """Analisa dampak berita ke gold menggunakan Claude API"""
+    if not ANTHROPIC_KEY or not articles:
+        return None
+    try:
+        news_text = "\n".join([
+            f"{i+1}. {a['title']}\n   {a['desc']}"
+            for i, a in enumerate(articles)
+        ])
+        prompt = f"""Kamu adalah analis trading gold profesional.
+
+Harga Gold saat ini: ${price:.2f}
+
+Berita terbaru tentang gold:
+{news_text}
+
+Berikan analisa SINGKAT dalam format:
+BIAS: [BULLISH/BEARISH/NETRAL]
+DAMPAK: [Penjelasan 1 kalimat dampak ke gold]
+LEVEL: [Support dan resistance kunci hari ini]
+STRATEGI: [1-2 kalimat saran trading]
+RISIKO: [1 risiko utama yang perlu diwaspadai]
+
+Jawab dalam Bahasa Indonesia, singkat dan langsung."""
+
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+        data = r.json()
+        return data["content"][0]["text"] if data.get("content") else None
+    except Exception as e:
+        print(f"[AI NEWS] {e}")
+        return None
+
+def parse_ai_analysis(text):
+    """Parse hasil AI analysis"""
+    if not text: return {}
+    result = {}
+    for line in text.split("\n"):
+        if ":" in line:
+            key, _, val = line.partition(":")
+            result[key.strip()] = val.strip()
+    return result
+
+def send_news_briefing(price, is_breaking=False):
+    """Kirim news briefing ke Telegram"""
+    articles = fetch_gold_news()
+    if not articles:
+        print("[NEWS] No articles found")
+        return
+
+    # Analisa AI
+    ai_text    = analyze_news_with_ai(articles, price)
+    ai_parsed  = parse_ai_analysis(ai_text) if ai_text else {}
+
+    # Tentukan bias emoji
+    bias = ai_parsed.get("BIAS", "NETRAL")
+    if "BULLISH" in bias.upper():
+        bias_emoji = "📈"
+    elif "BEARISH" in bias.upper():
+        bias_emoji = "📉"
+    else:
+        bias_emoji = "⚠️"
+
+    # Format berita
+    news_text = ""
+    for i, a in enumerate(articles[:3]):
+        news_text += f"\n{i+1}. *{a['title'][:80]}*"
+        if a["desc"]:
+            news_text += f"\n   _{a['desc'][:100]}_"
+
+    # Yield zone check
+    y_data = fetch_us10y_yield()
+    yield_text = ""
+    if y_data:
+        ya = analyze_yield(y_data)
+        yield_text = f"\n\n💹 *US 10Y Yield:* {ya['emoji']} {ya['label']}"
+
+    header = "🚨 *BREAKING NEWS GOLD!*" if is_breaking else "📰 *GOLD NEWS UPDATE*"
+    moon   = get_moon_phase()
+    impact = get_moon_impact(moon["phase_en"])
+
+    msg = (
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💰 Harga: *${price:.2f}*\n"
+        f"🕐 {now_wita().strftime('%H:%M')} WITA\n\n"
+        f"📋 *BERITA TERKINI:*{news_text}\n"
+        f"━━━━━━━━━━━━━━\n"
+    )
+
+    if ai_text:
+        msg += (
+            f"🤖 *ANALISA AI:*\n"
+            f"{bias_emoji} Bias: *{ai_parsed.get('BIAS','?')}*\n"
+        )
+        if ai_parsed.get("DAMPAK"):
+            msg += f"💥 {ai_parsed['DAMPAK']}\n"
+        if ai_parsed.get("LEVEL"):
+            msg += f"📊 {ai_parsed['LEVEL']}\n"
+        if ai_parsed.get("STRATEGI"):
+            msg += f"💡 {ai_parsed['STRATEGI']}\n"
+        if ai_parsed.get("RISIKO"):
+            msg += f"⚠️ {ai_parsed['RISIKO']}\n"
+        msg += "━━━━━━━━━━━━━━\n"
+
+    msg += (
+        f"{yield_text}\n\n"
+        f"🌙 {moon['phase']} | {impact['bias']}\n"
+        f"📡 Yahoo Finance | AI: Claude\n"
+        f"⚠️ _Bukan saran investasi_"
+    )
+    send_telegram(msg)
+    print(f"[NEWS] Briefing sent, {len(articles)} articles")
+
+def get_economic_calendar_today():
+    """Jadwal news high impact hari ini"""
+    now  = now_wita()
+    day  = now.weekday()
+    # News penting rutin mingguan (WIB)
+    weekly = {
+        1: [  # Selasa
+            {"time":"20:30","impact":"🟡","name":"US Retail Sales","desc":"Konsumsi retail US"},
+        ],
+        2: [  # Rabu
+            {"time":"21:30","impact":"🔴","name":"FOMC Minutes / CPI","desc":"Kebijakan Fed & inflasi"},
+            {"time":"03:00","impact":"🔴","name":"FOMC Rate Decision","desc":"Keputusan suku bunga (kalau ada)"},
+        ],
+        3: [  # Kamis
+            {"time":"19:30","impact":"🔴","name":"US Initial Jobless Claims","desc":"Data pengangguran mingguan"},
+            {"time":"20:30","impact":"🟡","name":"US PPI","desc":"Producer Price Index"},
+        ],
+        4: [  # Jumat
+            {"time":"20:30","impact":"🔴","name":"US NFP / CPI","desc":"Non-Farm Payroll & inflasi"},
+            {"time":"22:00","impact":"🟡","name":"UoM Consumer Sentiment","desc":"Sentimen konsumen"},
+        ],
+    }
+    return weekly.get(day, [])
+
+def send_calendar_alert():
+    """Kirim kalender news hari ini"""
+    events = get_economic_calendar_today()
+    if not events: return
+    now  = now_wita()
+    day_name = ["Senin","Selasa","Rabu","Kamis","Jumat","Sabtu","Minggu"][now.weekday()]
+    events_text = ""
+    for e in events:
+        events_text += (
+            f"\n{e['impact']} *{e['time']} WITA* — {e['name']}"
+            f"\n   📝 {e['desc']}"
+        )
+    send_telegram(
+        f"📅 *ECONOMIC CALENDAR*\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📆 {day_name}, {now.day} {get_month_name()} {now.year}\n\n"
+        f"*News High Impact Hari Ini:*{events_text}\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🔴 HIGH = Jangan trading saat keluar!\n"
+        f"🟡 MEDIUM = Kurangi size posisi\n\n"
+        f"💡 Ketik /news untuk berita & analisa terkini!"
+    )
+
+
 def get_luck_status(date=None):
     """Ambil status luck hari ini dari kalender Sinarmas"""
     if date is None:
@@ -91,8 +405,9 @@ def get_luck_status(date=None):
         }
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID   = os.environ.get("CHAT_ID")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN")
+CHAT_ID    = os.environ.get("CHAT_ID")
+FRED_KEY   = os.environ.get("FRED_API_KEY", "638b72616ca3504d71817c63e820aeb5")
 FETCH_INTERVAL = 15
 SR_TOLERANCE   = 10
 
@@ -504,6 +819,8 @@ def send_morning_briefing(price):
         f"💡 {impact['trading']}\n\n"
         f"🪐\n{planet_text}\n\n"
         f"⚠️ *Rules:* BOS dulu | SL wajib | R:R 1:2\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💡 Ketik /yield untuk US 10Y Yield update\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Semangat! 💪🥇\n⚠️ _Bukan saran investasi_"
     )
@@ -572,6 +889,9 @@ state = {
     "last_day":None,"last_update":0,"briefing_sent":False,
     "weekly_sent":False,"storm_alerted":False,"low_asia_swept":False,
     "kz_alerted":set(),
+    # Yield tracking
+    "last_yield": None, "last_yield_zone": None, "yield_alerted_today": False,
+    "yield_checked": False,
 }
 
 def reset_daily():
@@ -586,6 +906,12 @@ def reset_daily():
         "bos_m15":None,"bos_m15_time":None,
         "last_day":today,"briefing_sent":False,
         "storm_alerted":False,"low_asia_swept":False,"kz_alerted":set(),
+        "yield_alerted_today":False,"yield_checked":False,
+        "news_sent_morning":False,"news_sent_afternoon":False,"calendar_sent":False,
+    "news_sent_morning":False,"news_sent_afternoon":False,"calendar_sent":False,
+    # Yield tracking
+    "last_yield": None, "last_yield_zone": None, "yield_alerted_today": False,
+    "yield_checked": False,
     })
 
 # ── 🕐 KILLZONE ALERTS ────────────────────────────────────
@@ -644,6 +970,41 @@ def check_killzone_alerts():
                 f"⚠️ _Bukan saran investasi_"
             )
             print(f"[KILLZONE] {kz['name']} @ {h:02d}:{m:02d} WITA")
+
+def check_yield_daily():
+    """Cek yield setiap hari jam 19:00 WITA"""
+    now = now_wita()
+    if now.hour == 19 and now.minute < 1 and not state["yield_checked"]:
+        state["yield_checked"] = True
+        y = fetch_us10y_yield()
+        if y:
+            analysis = analyze_yield(y)
+            analysis["date"] = y["date"]
+            prev_zone = state.get("last_yield_zone")
+            is_new = (prev_zone != analysis["zone"])
+            state["last_yield"] = y["yield"]
+            state["last_yield_zone"] = analysis["zone"]
+            if is_new or analysis["zone"] == "DANGER":
+                send_yield_alert(analysis, is_new=is_new)
+            print(f"[YIELD] {y['yield']}% Zone:{analysis['zone']}")
+
+def check_news_schedule():
+    """Kirim news & calendar sesuai jadwal"""
+    now = now_wita()
+    p   = state["prev_price"] or 0
+    if not p: return
+    # Kalender news jam 08:30 WITA (setelah morning briefing)
+    if now.hour==8 and 30<=now.minute<31 and not state["calendar_sent"]:
+        state["calendar_sent"] = True
+        send_calendar_alert()
+    # News pagi jam 09:00 WITA
+    if now.hour==9 and now.minute<1 and not state["news_sent_morning"]:
+        state["news_sent_morning"] = True
+        send_news_briefing(p)
+    # News sore jam 16:00 WITA (setelah London open)
+    if now.hour==16 and now.minute<1 and not state["news_sent_afternoon"]:
+        state["news_sent_afternoon"] = True
+        send_news_briefing(p)
 
 def check_briefings():
     now=now_wita(); p=state["prev_price"]
@@ -849,6 +1210,10 @@ def handle_commands():
                 f"/astro     → Planet hari ini\n"
                 f"/listsr    → Level S&R\n"
                 f"/bos       → Status BOS M15 & M5 sekarang\n"
+                f"/news      → Berita gold + analisa AI\n"
+                f"/calendar  → Jadwal news hari ini\n"
+                f"/yield     → US 10Y Yield + Trump Zone\n"
+                f"/trump     → Penjelasan Trump Yield Theory\n"
                 f"/patterns  → Info candle patterns\n"
                 f"/help      → Menu ini\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -1079,6 +1444,53 @@ def handle_commands():
                 f"🕐 {now_wita().strftime('%H:%M:%S')} WITA"
             )
 
+        elif text=="/news":
+            p = state["prev_price"] or 0
+            send_telegram("⏳ Mengambil berita & analisa AI... Tunggu sebentar!")
+            send_news_briefing(p)
+
+        elif text=="/calendar":
+            send_calendar_alert()
+
+        elif text=="/yield":
+            y = fetch_us10y_yield()
+            if not y:
+                send_telegram("⏳ Data yield belum tersedia. Coba lagi nanti.")
+            else:
+                analysis = analyze_yield(y)
+                analysis["date"] = y["date"]
+                send_yield_alert(analysis, is_new=False)
+
+        elif text=="/trump":
+            send_telegram(
+                "🇺🇸 *TRUMP YIELD THEORY*\n"
+                "━━━━━━━━━━━━━━\n"
+                "📊 *Claim:*\n"
+                "Dengan hutang $39 Triliun,\n"
+                "Trump buat 'good news' setiap kali\n"
+                "US 10Y Yield mendekati 4.3–4.5%\n"
+                "untuk cegah bunga naik!\n\n"
+                "━━━━━━━━━━━━━━\n"
+                "📈 *Backtest 17 Events (2025–2026):*\n"
+                "✅ Yield turun: 13/16 = *81%*\n"
+                "❌ Yield naik:   3/16 = 19%\n\n"
+                "📋 *Contoh Trump good news:*\n"
+                "• No China tariffs\n"
+                "• 90-day pause tariffs\n"
+                "• US-UK trade deal\n"
+                "• Iran peace talks\n\n"
+                "━━━━━━━━━━━━━━\n"
+                "🎯 *Dampak ke Gold:*\n"
+                "Yield turun → USD lemah → Gold NAIK!\n\n"
+                "⚡ *Trump Zone: 4.30–4.50%*\n"
+                "→ Kalau yield masuk zone ini\n"
+                "  bot otomatis kirim alert!\n"
+                "→ 81% yield akan turun\n"
+                "→ Siapkan setup BUY gold!\n"
+                "━━━━━━━━━━━━━━\n"
+                "Ketik /yield untuk cek data sekarang!"
+            )
+
         elif text=="/patterns":
             send_telegram(
                 f"🕯 *CANDLE PATTERNS*\n━━━━━━━━━━━━━━\n\n"
@@ -1104,11 +1516,13 @@ def main():
     print("="*50)
     moon=get_moon_phase(); impact=get_moon_impact(moon["phase_en"])
     send_telegram(
-        f"🚀 *XAUUSD Bot v11 — Clean Signal Edition!*\n━━━━━━━━━━━━━━\n"
+        f"🚀 *XAUUSD Bot v13 — AI News Edition!*\n━━━━━━━━━━━━━━\n"
         f"📡 gold-api.com | 📊 M5 | 🕐 WITA\n\n"
         f"*Fitur:*\n"
         f"⏰ Killzone Alert otomatis (WITA)\n"
         f"📊 BOS M15 (utama) + M5 filter\n"
+        f"📰 AI News Analysis otomatis\n"
+        f"📅 Economic Calendar harian\n"
         f"🔕 Candle pattern & M5 BOS = silent mode\n"
         f"🕯 Candle Pattern 3 Tier\n"
         f"🌪️ Perfect Storm detection\n"
@@ -1133,6 +1547,8 @@ def main():
         try:
             reset_daily()
             check_briefings()
+            check_yield_daily()
+            check_news_schedule()
             check_killzone_alerts()
             handle_commands()
             price=fetch_price()
